@@ -21,6 +21,9 @@ pub enum Error {
     #[error(transparent)]
     IsoTPError(#[from] crate::isotp::Error),
 
+    #[error(transparent)]
+    Tp20Error(#[from] crate::tp20::Error),
+
     #[cfg(feature = "panda")]
     #[error(transparent)]
     LibUsbError(#[from] rusb::Error),

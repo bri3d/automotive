@@ -81,6 +81,7 @@
 pub mod can;
 mod error;
 pub mod isotp;
+pub mod tp20;
 pub mod uds;
 
 /// Re-export of relevant stream traits from `tokio_stream`.
