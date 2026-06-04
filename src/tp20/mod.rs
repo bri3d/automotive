@@ -233,7 +233,7 @@ pub struct Tp20Transport {
     cmd_tx: mpsc::Sender<Cmd>,
     pdu_tx: broadcast::Sender<Vec<u8>>,
     shutdown: Option<oneshot::Sender<()>>,
-    _task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
     timeout: std::time::Duration,
 }
 
@@ -261,11 +261,23 @@ impl Tp20Transport {
                 cmd_tx,
                 pdu_tx,
                 shutdown: Some(shutdown_tx),
-                _task: task,
+                task: Some(task),
                 timeout: config.timeout,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(crate::Error::Disconnected),
+        }
+    }
+
+    /// Gracefully close the channel: send a disconnect and wait for the
+    /// background task — and the CAN adapter it owns — to fully release. Prefer
+    /// this over dropping when the underlying adapter teardown blocks (J2534).
+    pub async fn shutdown(mut self) {
+        if let Some(s) = self.shutdown.take() {
+            let _ = s.send(());
+        }
+        if let Some(t) = self.task.take() {
+            let _ = t.await;
         }
     }
 }
