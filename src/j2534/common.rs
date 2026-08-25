@@ -226,8 +226,11 @@ pub struct J2534Device {
     pub(crate) write: FnPassThruWriteMsgs,
     pub(crate) filter: FnPassThruStartMsgFilter,
     pub(crate) ioctl: FnPassThruIoctl,
-    /// Keeps the DLL loaded for the lifetime of this device.
-    pub(crate) _lib: libloading::Library,
+    /// The DLL these function pointers came from.
+    ///
+    /// A borrow, not an owned handle: PassThru DLLs are loaded once per process
+    /// and never unloaded — see [`load_library`].
+    pub(crate) _lib: &'static libloading::Library,
 }
 
 impl Drop for J2534Device {
@@ -365,6 +368,50 @@ pub fn parse_can_id(msg: &PassThruMsg) -> Identifier {
     }
 }
 
+/// Load a PassThru DLL once and keep it loaded for the life of the process.
+///
+/// **A J2534 driver must never be unloaded.** Nothing in the specification says
+/// when `FreeLibrary` is safe, and in practice it never is: a driver typically
+/// keeps threads of its own — a USB or socket reader — and `PassThruClose`
+/// routinely returns while they are still running. Unmapping the module then
+/// pulls the code out from under a live thread and the process dies with an
+/// access violation attributed to `<driver>.dll_unloaded`, seconds after the
+/// last J2534 call and nowhere near it. Drivers also keep device state in
+/// process globals, which a reload silently resets.
+///
+/// Dropping a [`libloading::Library`] calls `FreeLibrary`, so owning one per
+/// [`J2534Device`] made every close a chance to crash — most visibly on a bus
+/// scan, which opens and closes a device per channel. Handing out `&'static`
+/// borrows from this table instead means the first open of a given DLL loads
+/// it and nothing ever unloads it. The leak is one module per distinct driver
+/// path, and it matches what [`crate::vector`] already does with `vxlapi64`.
+fn load_library(path: &str) -> Result<&'static libloading::Library> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static LIBRARIES: OnceLock<Mutex<HashMap<String, &'static libloading::Library>>> =
+        OnceLock::new();
+
+    let mut libraries = LIBRARIES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if let Some(lib) = libraries.get(path) {
+        return Ok(*lib);
+    }
+
+    let lib = match unsafe { libloading::Library::new(path) } {
+        Ok(l) => l,
+        Err(e) => return Err(J2534Error::DllError(format!("Cannot load {path}: {e}")).into()),
+    };
+    // Deliberately leaked: see above.
+    let lib: &'static libloading::Library = Box::leak(Box::new(lib));
+    libraries.insert(path.to_owned(), lib);
+    tracing::debug!(path, "Loaded J2534 DLL");
+    Ok(lib)
+}
+
 /// Load a J2534 DLL, resolve all function pointers, and call `PassThruOpen`.
 ///
 /// Pass `None` for `dll_path` to auto-discover the first 64-bit PassThru
@@ -372,10 +419,7 @@ pub fn parse_can_id(msg: &PassThruMsg) -> Identifier {
 pub fn open_device(dll_path: Option<&str>) -> Result<J2534Device> {
     let path = super::dll::resolve_dll_path(dll_path)?;
 
-    let lib = match unsafe { libloading::Library::new(&path) } {
-        Ok(l) => l,
-        Err(e) => return Err(J2534Error::DllError(format!("Cannot load {path}: {e}")).into()),
-    };
+    let lib = load_library(&path)?;
 
     macro_rules! sym {
         ($name:literal, $ty:ty) => {

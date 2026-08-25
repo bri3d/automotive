@@ -24,6 +24,9 @@ pub enum Error {
     #[error(transparent)]
     Tp20Error(#[from] crate::tp20::Error),
 
+    #[error(transparent)]
+    DoIpError(#[from] crate::doip::Error),
+
     #[cfg(feature = "panda")]
     #[error(transparent)]
     LibUsbError(#[from] rusb::Error),

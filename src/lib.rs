@@ -79,6 +79,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod can;
+pub mod doip;
 mod error;
 pub mod isotp;
 pub mod tp20;
