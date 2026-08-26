@@ -194,7 +194,10 @@ struct Reassembler {
 
 impl Reassembler {
     fn push(&mut self, frame: &[u8]) -> RxOutcome {
-        let mut out = RxOutcome { ack_seq: None, pdu: None };
+        let mut out = RxOutcome {
+            ack_seq: None,
+            pdu: None,
+        };
         let Some(&b0) = frame.first() else { return out };
         let frame_type = match FrameType::from_repr(b0 & OPCODE_MASK) {
             Some(ft) => ft,
@@ -407,7 +410,13 @@ async fn handshake(
         .timeout(config.timeout);
     tokio::pin!(setup);
 
-    send_raw(adapter, config.bus, config.setup_id, &encode_setup_request(config)).await;
+    send_raw(
+        adapter,
+        config.bus,
+        config.setup_id,
+        &encode_setup_request(config),
+    )
+    .await;
     let resp = setup.next().await.unwrap()?;
     let (tx_id, rx_id) = parse_setup_response(&resp.data)?;
     debug!("channel set up, tx {:03x} rx {:03x}", tx_id, rx_id);
@@ -418,7 +427,20 @@ async fn handshake(
         .recv_filter(move |frame| u32::from(frame.id) == rx_id && !frame.loopback)
         .timeout(config.timeout);
     tokio::pin!(params);
-    send_raw(adapter, config.bus, tx_id, &[ChannelType::ParamsRequest as u8, 0x0f, 0x8a, 0xff, 0x32, 0xff]).await;
+    send_raw(
+        adapter,
+        config.bus,
+        tx_id,
+        &[
+            ChannelType::ParamsRequest as u8,
+            0x0f,
+            0x8a,
+            0xff,
+            0x32,
+            0xff,
+        ],
+    )
+    .await;
 
     let resp = loop {
         let frame = params.next().await.unwrap()?;
@@ -457,7 +479,10 @@ async fn transmit(
             u32::from(frame.id) == rx_id
                 && !frame.loopback
                 && matches!(
-                    frame.data.first().map(|b| FrameType::from_repr(b & OPCODE_MASK)),
+                    frame
+                        .data
+                        .first()
+                        .map(|b| FrameType::from_repr(b & OPCODE_MASK)),
                     Some(Some(FrameType::AckReady | FrameType::AckWait))
                 )
         })
@@ -485,7 +510,9 @@ async fn receive_ack(
 ) -> Result<()> {
     loop {
         let frame = stream.next().await.unwrap()?;
-        let Some(&b0) = frame.data.first() else { continue };
+        let Some(&b0) = frame.data.first() else {
+            continue;
+        };
         match FrameType::from_repr(b0 & OPCODE_MASK) {
             Some(FrameType::AckWait) => continue,
             Some(FrameType::AckReady) => {
@@ -493,7 +520,11 @@ async fn receive_ack(
                 if got == expected_seq {
                     return Ok(());
                 }
-                return Err(Error::BadAck { got, expected: expected_seq }.into());
+                return Err(Error::BadAck {
+                    got,
+                    expected: expected_seq,
+                }
+                .into());
             }
             _ => continue,
         }
@@ -556,13 +587,16 @@ mod tests {
         let opcodes: Vec<u8> = frames.iter().map(|f| f.bytes[0] & OPCODE_MASK).collect();
         let seqs: Vec<u8> = frames.iter().map(|f| f.bytes[0] & SEQUENCE_MASK).collect();
         assert_eq!(seqs, [0x0e, 0x0f, 0x00, 0x01, 0x02]); // wraps F→0
-        assert_eq!(opcodes, [
-            FrameType::DataMore as u8,
-            FrameType::DataAckMore as u8, // block boundary
-            FrameType::DataMore as u8,
-            FrameType::DataAckMore as u8, // block boundary
-            FrameType::DataAckLast as u8, // final
-        ]);
+        assert_eq!(
+            opcodes,
+            [
+                FrameType::DataMore as u8,
+                FrameType::DataAckMore as u8, // block boundary
+                FrameType::DataMore as u8,
+                FrameType::DataAckMore as u8, // block boundary
+                FrameType::DataAckLast as u8, // final
+            ]
+        );
         let acks: Vec<bool> = frames.iter().map(|f| f.await_ack).collect();
         assert_eq!(acks, [false, true, false, true, true]);
         assert_eq!(next, 0x03);
