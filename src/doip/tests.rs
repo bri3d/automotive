@@ -74,10 +74,18 @@ fn header_round_trips() {
 
 #[test]
 fn a_bad_inverse_version_is_rejected() {
-    let mut msg = encode(PayloadType::VehicleIdRequest, &[]);
+    let mut msg = encode(PayloadType::DiagnosticMessage, &[]);
     msg[1] = 0x00;
     assert!(matches!(decode(&msg), Err(Error::BadVersion(0x02, 0x00))));
 }
+
+#[test]
+fn a_vehicle_id_request_uses_the_wildcard_version() {
+    let msg = encode(PayloadType::VehicleIdRequest, &[]);
+    assert_eq!(&msg[0..4], &[0xff, 0x00, 0x00, 0x01]);
+    assert_eq!(&msg[4..8], &0u32.to_be_bytes());
+}
+
 
 #[test]
 fn a_truncated_payload_is_rejected() {

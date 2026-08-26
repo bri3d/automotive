@@ -13,7 +13,7 @@ pub use constants::{
 };
 pub use error::Error;
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use async_stream::stream;
@@ -27,7 +27,7 @@ use crate::{Result, Stream, TransportLayer};
 
 use constants::{
     diagnostic_nack_reason, header_nack_reason, routing_activation_reason, ACK_OK, HEADER_LEN,
-    MAX_PAYLOAD, ROUTING_ACTIVATION_SUCCESS,
+    MAX_PAYLOAD, ROUTING_ACTIVATION_SUCCESS, VEHICLE_ID_VERSION,
 };
 
 const DEFAULT_TIMEOUT_MS: u64 = 2000;
@@ -75,10 +75,22 @@ pub struct VehicleAnnouncement {
 
 // ── Message framing ─────────────────────────────────────────────────────────
 
+/// Identification requests carry [`VEHICLE_ID_VERSION`], everything else
+/// [`PROTOCOL_VERSION`].
+fn request_version(payload_type: PayloadType) -> u8 {
+    match payload_type {
+        PayloadType::VehicleIdRequest
+        | PayloadType::VehicleIdRequestEid
+        | PayloadType::VehicleIdRequestVin => VEHICLE_ID_VERSION,
+        _ => PROTOCOL_VERSION,
+    }
+}
+
 fn encode(payload_type: PayloadType, payload: &[u8]) -> Vec<u8> {
+    let version = request_version(payload_type);
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.push(PROTOCOL_VERSION);
-    out.push(!PROTOCOL_VERSION);
+    out.push(version);
+    out.push(!version);
     out.extend_from_slice(&(payload_type as u16).to_be_bytes());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
@@ -171,16 +183,36 @@ fn parse_announcement(source: SocketAddr, payload: &[u8]) -> Option<VehicleAnnou
 
 // ── Discovery ───────────────────────────────────────────────────────────────
 
+/// Discovery destinations: the link-local directed broadcast first, since a
+/// diagnostic NIC is APIPA-only and `255.255.255.255` leaves via whichever
+/// interface holds the default route.
+const BROADCAST_ADDRS: [Ipv4Addr; 2] = [Ipv4Addr::new(169, 254, 255, 255), Ipv4Addr::BROADCAST];
+
 /// Broadcast a vehicle identification request and collect answers until
 /// `timeout` elapses. Entities are deduplicated by source IP.
 pub async fn discover(timeout: Duration) -> Result<Vec<VehicleAnnouncement>> {
     let socket = UdpSocket::bind(("0.0.0.0", 0)).await.map_err(Error::from)?;
     socket.set_broadcast(true).map_err(Error::from)?;
     let request = encode(PayloadType::VehicleIdRequest, &[]);
-    socket
-        .send_to(&request, ("255.255.255.255", PORT))
-        .await
-        .map_err(Error::from)?;
+
+    let mut sent = false;
+    let mut last_error = None;
+    for addr in BROADCAST_ADDRS {
+        // An unreachable destination must not sink the other.
+        match socket
+            .send_to(&request, SocketAddrV4::new(addr, PORT))
+            .await
+        {
+            Ok(_) => sent = true,
+            Err(e) => {
+                debug!("DoIP request to {addr} failed: {e}");
+                last_error = Some(e);
+            }
+        }
+    }
+    if !sent {
+        return Err(Error::from(last_error.expect("a failed send sets last_error")).into());
+    }
 
     let mut found: Vec<VehicleAnnouncement> = Vec::new();
     let deadline = tokio::time::Instant::now() + timeout;

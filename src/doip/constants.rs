@@ -2,6 +2,9 @@ use strum_macros::FromRepr;
 
 /// ISO 13400-2:2012 protocol version.
 pub const PROTOCOL_VERSION: u8 = 0x02;
+/// Version for vehicle identification requests, sent before the entity's own
+/// version is known (ISO 13400-2 Table 12). Strict entities ignore anything else.
+pub const VEHICLE_ID_VERSION: u8 = 0xff;
 /// Registered DoIP port, TCP (diagnostics) and UDP (discovery).
 pub const PORT: u16 = 13400;
 
