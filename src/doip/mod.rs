@@ -13,13 +13,13 @@ pub use constants::{
 };
 pub use error::Error;
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 use async_stream::stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{lookup_host, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::debug;
 
@@ -47,6 +47,10 @@ pub struct DoIpConfig {
     pub activation_type: u8,
     /// Connect, routing-activation and acknowledgement timeout.
     pub timeout: Duration,
+    /// Local address to connect from — [`VehicleAnnouncement::local`] of the
+    /// entity this config addresses. `None` lets the routing table choose,
+    /// which only works when one interface can reach `host`.
+    pub local_address: Option<IpAddr>,
 }
 
 impl DoIpConfig {
@@ -58,6 +62,7 @@ impl DoIpConfig {
             ecu_address,
             activation_type: ACTIVATION_TYPE_DEFAULT,
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+            local_address: None,
         }
     }
 }
@@ -66,6 +71,10 @@ impl DoIpConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleAnnouncement {
     pub source: SocketAddr,
+    /// Local interface address the answer arrived on. Carry it into
+    /// [`DoIpConfig::local_address`]: on a multi-homed host it is the only
+    /// record of which NIC the entity is actually reachable through.
+    pub local: Option<IpAddr>,
     pub vin: String,
     pub logical_address: u16,
     pub eid: [u8; 6],
@@ -165,12 +174,17 @@ fn parse_routing_activation(payload: &[u8]) -> std::result::Result<u16, Error> {
     Ok(entity)
 }
 
-fn parse_announcement(source: SocketAddr, payload: &[u8]) -> Option<VehicleAnnouncement> {
+fn parse_announcement(
+    source: SocketAddr,
+    local: Option<IpAddr>,
+    payload: &[u8],
+) -> Option<VehicleAnnouncement> {
     if payload.len() < 32 {
         return None;
     }
     Some(VehicleAnnouncement {
         source,
+        local,
         vin: String::from_utf8_lossy(&payload[0..17])
             .trim_matches(|c: char| c == '\0' || c.is_whitespace())
             .to_string(),
@@ -183,57 +197,193 @@ fn parse_announcement(source: SocketAddr, payload: &[u8]) -> Option<VehicleAnnou
 
 // ── Discovery ───────────────────────────────────────────────────────────────
 
-/// Discovery destinations: the link-local directed broadcast first, since a
-/// diagnostic NIC is APIPA-only and `255.255.255.255` leaves via whichever
-/// interface holds the default route.
-const BROADCAST_ADDRS: [Ipv4Addr; 2] = [Ipv4Addr::new(169, 254, 255, 255), Ipv4Addr::BROADCAST];
+/// How often the identification request is repeated while waiting. A single
+/// datagram is easy to lose: the entity may still be bringing its Ethernet
+/// stack up, and nothing retransmits UDP. A reference tester repeats at 2 s.
+const DISCOVERY_RETRY: Duration = Duration::from_millis(500);
 
-/// Broadcast a vehicle identification request and collect answers until
-/// `timeout` elapses. Entities are deduplicated by source IP.
-pub async fn discover(timeout: Duration) -> Result<Vec<VehicleAnnouncement>> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).await.map_err(Error::from)?;
-    socket.set_broadcast(true).map_err(Error::from)?;
-    let request = encode(PayloadType::VehicleIdRequest, &[]);
+/// Depth of the channel carrying announcements back from the per-interface
+/// tasks; a bus full of entities answering at once must not block a receive.
+const DISCOVERY_CHANNEL_DEPTH: usize = 32;
 
+/// A local interface to search from: the address to bind, and where to send.
+struct DiscoveryIface {
+    bind: Ipv4Addr,
+    destinations: Vec<SocketAddrV4>,
+}
+
+/// The all-ones host address of `ip`'s subnet.
+fn directed_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
+}
+
+/// Every non-loopback IPv4 interface, each with its own directed broadcast.
+///
+/// Sending from one wildcard socket is what makes discovery come back empty on
+/// a multi-homed host: the destination alone picks the interface, via the
+/// routing table. `255.255.255.255` leaves by the default route — the Wi-Fi or
+/// LAN NIC, never the diagnostic one, which is APIPA-only and has no default
+/// route. `169.254.255.255` is no safer: a VPN adapter that installs its own
+/// `169.254.0.0/16` route at a lower metric wins it outright, and the request
+/// disappears into the tunnel. Binding a socket per interface takes the
+/// decision away from the routing table, so the request leaves every NIC the
+/// entity could be on.
+fn discovery_interfaces() -> Vec<DiscoveryIface> {
+    let ifaces = match if_addrs::get_if_addrs() {
+        Ok(i) => i,
+        Err(e) => {
+            debug!("DoIP: cannot enumerate interfaces: {e}");
+            return Vec::new();
+        }
+    };
+    ifaces
+        .into_iter()
+        .filter(|i| !i.is_loopback())
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(v4) => Some(v4),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .map(|v4| {
+            let directed = v4
+                .broadcast
+                .unwrap_or_else(|| directed_broadcast(v4.ip, v4.netmask));
+            let mut destinations = vec![SocketAddrV4::new(directed, PORT)];
+            // Entities that only listen for the limited broadcast still answer,
+            // and the source binding keeps it on this interface.
+            if directed != Ipv4Addr::BROADCAST {
+                destinations.push(SocketAddrV4::new(Ipv4Addr::BROADCAST, PORT));
+            }
+            DiscoveryIface {
+                bind: v4.ip,
+                destinations,
+            }
+        })
+        .collect()
+}
+
+/// Repeat the request on one socket and forward every announcement it draws,
+/// until `deadline`. `Err` means no send ever succeeded on this interface.
+async fn discovery_task(
+    socket: UdpSocket,
+    local: Option<IpAddr>,
+    destinations: Vec<SocketAddrV4>,
+    request: Vec<u8>,
+    deadline: tokio::time::Instant,
+    tx: mpsc::Sender<VehicleAnnouncement>,
+) -> std::result::Result<(), std::io::Error> {
+    let mut buf = [0u8; 1024];
     let mut sent = false;
     let mut last_error = None;
-    for addr in BROADCAST_ADDRS {
-        // An unreachable destination must not sink the other.
-        match socket
-            .send_to(&request, SocketAddrV4::new(addr, PORT))
-            .await
-        {
-            Ok(_) => sent = true,
-            Err(e) => {
-                debug!("DoIP request to {addr} failed: {e}");
-                last_error = Some(e);
+    let mut next_send = tokio::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep_until(next_send) => {
+                for addr in &destinations {
+                    // An unreachable destination must not sink the others.
+                    match socket.send_to(&request, *addr).await {
+                        Ok(_) => sent = true,
+                        Err(e) => {
+                            debug!("DoIP request to {addr} failed: {e}");
+                            last_error = Some(e);
+                        }
+                    }
+                }
+                next_send += DISCOVERY_RETRY;
+            }
+            received = socket.recv_from(&mut buf) => {
+                let Ok((n, source)) = received else { break };
+                let Ok((payload_type, payload)) = decode(&buf[..n]) else {
+                    continue;
+                };
+                if PayloadType::from_repr(payload_type) != Some(PayloadType::VehicleAnnouncement) {
+                    continue;
+                }
+                if let Some(a) = parse_announcement(source, local, payload) {
+                    if tx.send(a).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     }
-    if !sent {
-        return Err(Error::from(last_error.expect("a failed send sets last_error")).into());
+
+    match last_error {
+        Some(e) if !sent => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Broadcast a vehicle identification request on every local interface and
+/// collect answers until `timeout` elapses. Entities are deduplicated by
+/// source IP, so the repeats and the two destinations yield one entry each.
+pub async fn discover(timeout: Duration) -> Result<Vec<VehicleAnnouncement>> {
+    let request = encode(PayloadType::VehicleIdRequest, &[]);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let mut ifaces = discovery_interfaces();
+    if ifaces.is_empty() {
+        // Enumeration failed; fall back to letting the routing table choose.
+        ifaces.push(DiscoveryIface {
+            bind: Ipv4Addr::UNSPECIFIED,
+            destinations: vec![SocketAddrV4::new(Ipv4Addr::BROADCAST, PORT)],
+        });
+    }
+
+    let (tx, mut rx) = mpsc::channel(DISCOVERY_CHANNEL_DEPTH);
+    let mut tasks = Vec::new();
+    let mut bind_error = None;
+    for iface in ifaces {
+        let socket = match UdpSocket::bind((iface.bind, 0)).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("DoIP: cannot bind {}: {e}", iface.bind);
+                bind_error = Some(e);
+                continue;
+            }
+        };
+        if let Err(e) = socket.set_broadcast(true) {
+            debug!("DoIP: cannot broadcast from {}: {e}", iface.bind);
+            bind_error = Some(e);
+            continue;
+        }
+        // An unspecified bind is the fallback: there is no NIC to record.
+        let local = (!iface.bind.is_unspecified()).then_some(IpAddr::V4(iface.bind));
+        tasks.push(tokio::spawn(discovery_task(
+            socket,
+            local,
+            iface.destinations,
+            request.clone(),
+            deadline,
+            tx.clone(),
+        )));
+    }
+    // The receive loop below ends when the last task drops its sender.
+    drop(tx);
+    if tasks.is_empty() {
+        return Err(Error::from(bind_error.expect("no socket means a bind failed")).into());
     }
 
     let mut found: Vec<VehicleAnnouncement> = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut buf = [0u8; 1024];
-    while let Ok(Ok((n, source))) =
-        tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await
-    {
-        let Ok((payload_type, payload)) = decode(&buf[..n]) else {
-            continue;
-        };
-        if PayloadType::from_repr(payload_type) != Some(PayloadType::VehicleAnnouncement) {
-            continue;
-        }
-        if let Some(a) = parse_announcement(source, payload) {
-            if !found.iter().any(|f| f.source.ip() == a.source.ip()) {
-                debug!("DoIP entity {} at {}", a.vin, a.source);
-                found.push(a);
-            }
+    while let Some(a) = rx.recv().await {
+        if !found.iter().any(|f| f.source.ip() == a.source.ip()) {
+            debug!("DoIP entity {} at {}", a.vin, a.source);
+            found.push(a);
         }
     }
-    Ok(found)
+
+    let mut send_error = None;
+    for task in tasks {
+        if let Ok(Err(e)) = task.await {
+            send_error = Some(e);
+        }
+    }
+    // Every interface failing to send is the old single-socket error case.
+    match send_error {
+        Some(e) if found.is_empty() => Err(Error::from(e).into()),
+        _ => Ok(found),
+    }
 }
 
 // ── Transport ───────────────────────────────────────────────────────────────
@@ -257,11 +407,9 @@ impl DoIpTransport {
     /// Connect, activate routing, then spawn the socket task.
     pub async fn open(config: DoIpConfig) -> Result<Self> {
         let timeout = config.timeout;
-        let connect = TcpStream::connect((config.host.as_str(), config.port));
-        let stream = tokio::time::timeout(timeout, connect)
+        let stream = tokio::time::timeout(timeout, connect(&config))
             .await
-            .map_err(|_| crate::Error::Timeout)?
-            .map_err(Error::from)?;
+            .map_err(|_| crate::Error::Timeout)??;
         stream.set_nodelay(true).map_err(Error::from)?;
         let (mut rd, mut wr) = stream.into_split();
 
@@ -271,12 +419,11 @@ impl DoIpTransport {
             &encode_routing_activation(&config),
         )
         .await?;
-        let entity_address = match tokio::time::timeout(timeout, await_routing_activation(&mut rd))
-            .await
-        {
-            Ok(r) => r?,
-            Err(_) => return Err(crate::Error::Timeout),
-        };
+        let entity_address =
+            match tokio::time::timeout(timeout, await_routing_activation(&mut rd)).await {
+                Ok(r) => r?,
+                Err(_) => return Err(crate::Error::Timeout),
+            };
         debug!(
             "DoIP routing activated: entity 0x{:04x}, ECU 0x{:04x}",
             entity_address, config.ecu_address
@@ -285,7 +432,14 @@ impl DoIpTransport {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (pdu_tx, _) = broadcast::channel(PDU_CHANNEL_DEPTH);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let task = tokio::spawn(socket_task(rd, wr, config, cmd_rx, pdu_tx.clone(), shutdown_rx));
+        let task = tokio::spawn(socket_task(
+            rd,
+            wr,
+            config,
+            cmd_rx,
+            pdu_tx.clone(),
+            shutdown_rx,
+        ));
 
         Ok(Self {
             cmd_tx,
@@ -311,6 +465,44 @@ impl DoIpTransport {
             let _ = t.await;
         }
     }
+}
+
+/// Open the TCP socket, from [`DoIpConfig::local_address`] when one is set.
+///
+/// The source binding matters for the same reason discovery binds per
+/// interface: several NICs can carry a route to a link-local entity, and the
+/// one the routing table prefers is not necessarily the one that answered.
+async fn connect(config: &DoIpConfig) -> std::result::Result<TcpStream, Error> {
+    let Some(local) = config.local_address else {
+        return Ok(TcpStream::connect((config.host.as_str(), config.port)).await?);
+    };
+    let mut last_error = None;
+    for addr in lookup_host((config.host.as_str(), config.port)).await? {
+        if addr.is_ipv4() != local.is_ipv4() {
+            continue;
+        }
+        let socket = if local.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.bind(SocketAddr::new(local, 0))?;
+        match socket.connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                debug!("DoIP connect to {addr} from {local} failed: {e}");
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no address of {} matches local {local}", config.host),
+            )
+        })
+        .into())
 }
 
 impl Drop for DoIpTransport {

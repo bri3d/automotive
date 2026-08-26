@@ -33,6 +33,9 @@ test-vector = ["vector-xl"]
 async-stream = "0.3.5"
 bstr = "1.9.0"
 hex = "0.4"
+# `link-local` is required: without it if-addrs drops every 169.254.x.x
+# address on Windows, which is exactly where a DoIP entity lives.
+if-addrs = { version = "0.15", features = ["link-local"] }
 rusb = { version = "0.9", optional = true }
 serde = { version = "1.0.197", features = ["derive"], optional = true }
 strum = "0.26"
